@@ -1,0 +1,3 @@
+# Core engine is 100% dependency-free using Python Standard Library (sqlite3, urllib, re, json, argparse)
+# Optional dependency for enhanced binary PDF parsing
+pypdf>=4.0.0

@@ -162,12 +162,12 @@ def parse_and_index_document(doc_id, text, source_uri="local", contract_value=0.
     # Clear old sections for this doc_id
     cur.execute("DELETE FROM tor_sections_fts WHERE doc_id = ?", (doc_id,))
     
-    # Section slicing based on standard Thai procurement headings (ข้อ, หมวด, ตอน)
-    pattern = r"(หมวดที่?\s*\d+|ข้อที่?\s*\d+(?:\.\d+)*|ส่วนที่?\s*\d+|บทที่?\s*\d+)"
+    # Section slicing based on standard Thai procurement headings (ข้อ, หมวด, ตอน, ส่วน, บท)
+    pattern = r"(หมวด(?:ที่)?\s*\d+|ข้อ(?:ที่)?\s*\d+(?:\.\d+)*|ส่วน(?:ที่)?\s*\d+|บท(?:ที่)?\s*\d+)"
     chunks = re.split(pattern, text)
     
     if len(chunks) <= 1:
-        # Paragraph-based indexing
+        # Paragraph-based indexing fallback
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for idx, p in enumerate(paragraphs):
             cur.execute("""
@@ -175,13 +175,22 @@ def parse_and_index_document(doc_id, text, source_uri="local", contract_value=0.
                 VALUES (?, ?, ?, ?)
             """, (doc_id, f"Section {idx+1}", str(idx+1), p))
     else:
-        for i in range(1, len(chunks), 2):
-            clause_header = chunks[i].strip()
-            clause_body = chunks[i+1].strip() if i+1 < len(chunks) else ""
+        # Index preamble if non-empty
+        preamble = chunks[0].strip()
+        if preamble:
             cur.execute("""
                 INSERT INTO tor_sections_fts (doc_id, section_title, clause_number, content)
                 VALUES (?, ?, ?, ?)
-            """, (doc_id, clause_header, clause_header, clause_body))
+            """, (doc_id, "Preamble / General", "Preamble", preamble))
+
+        for i in range(1, len(chunks), 2):
+            clause_header = chunks[i].strip()
+            clause_body = chunks[i+1].strip() if i+1 < len(chunks) else ""
+            full_clause_content = f"{clause_header}\n{clause_body}".strip()
+            cur.execute("""
+                INSERT INTO tor_sections_fts (doc_id, section_title, clause_number, content)
+                VALUES (?, ?, ?, ?)
+            """, (doc_id, clause_header, clause_header, full_clause_content))
             
     conn.commit()
     conn.close()
@@ -273,7 +282,9 @@ def audit_document_clauses(doc_id, contract_value=0.0):
     """, (doc_id,))
     for clause_no, content in cur.fetchall():
         for line in content.split("\n"):
-            line_str = line.strip()
+            line_str = line.strip().lstrip(".:- ").strip()
+            if not line_str:
+                continue
             if any(k in line_str for k in ["SLA", "Priority", "MTTR", "Uptime", "ภายใน", "ร้อยละ 99"]):
                 sla_findings.append({
                     "clause": clause_no,
@@ -337,6 +348,49 @@ def audit_document_clauses(doc_id, contract_value=0.0):
     }
 
 
+def render_audit_markdown(audit_res):
+    """Renders audit findings into clean executive Markdown report."""
+    p_calc = audit_res.get("penalty_calculation", {})
+    contract_val = audit_res.get("contract_value", 0)
+    lines = [
+        f"# 🎯 Enterprise TOR Audit Report: {audit_res.get('doc_id')}",
+        f"\n**มูลค่าสัญญาประเมิน:** {contract_val:,.2f} บาท  ",
+        f"**ฐานกฎหมาย:** {p_calc.get('statutory_basis', 'พ.ร.บ. จัดซื้อจัดจ้างฯ 2560')}\n",
+        "## 1. 💰 การวิเคราะห์ค่าปรับและเพดานความเสียหาย (Liquidated Damages)",
+        f"- **อัตราค่าปรับรายวัน:** ร้อยละ {p_calc.get('rate_percent_per_day', 0.1)}% ต่อวัน ({p_calc.get('daily_penalty_thb', 0):,.2f} บาท/วัน)",
+        f"- **ค่าปรับสะสมต่อเดือน (30 วัน):** {p_calc.get('monthly_penalty_thb', 0):,.2f} บาท",
+        f"- **เพดานบอกเลิกสัญญา 10% (ม.103):** {p_calc.get('cap_10_percent_thb', 0):,.2f} บาท",
+        f"- **ส่งมอบล่าช้าสะสมเกิน:** {p_calc.get('days_to_termination_ceiling', 0)} วัน (ผู้ว่าจ้างมีสิทธิบอกเลิกสัญญาและริบหลักประกัน)\n",
+        "## 2. 🚩 จุดเสี่ยงและกับดักในสัญญา (Ponytail Risk Tags)",
+    ]
+    risks = audit_res.get("detected_risks", [])
+    if not risks:
+        lines.append("- ไม่พบข้อความกับดักที่เป็นความเสี่ยงระดับสูง")
+    else:
+        for r in risks:
+            lines.append(f"### `[{r['severity']}]` `[{r['tag']}]` ({r['clause']})")
+            lines.append(f"> \"{r['verbatim_snippet']}\"\n")
+            lines.append(f"**แนวทางแก้ไข:** {r['mitigation']}\n")
+
+    lines.append("## 3. ⏱️ ตัวชี้วัดระดับการให้บริการ (SLA Parameters)")
+    sla = audit_res.get("sla_findings", [])
+    if not sla:
+        lines.append("- ไม่พบข้อกำหนด SLA ชัดเจนในเอกสาร")
+    else:
+        for s in sla:
+            lines.append(f"- **{s['clause']}:** {s['text']}")
+
+    lines.append("\n## 4. 📦 งวดงานและการส่งมอบ (Delivery Milestones)")
+    milestones = audit_res.get("milestones", [])
+    if not milestones:
+        lines.append("- ไม่พบตารางงวดงานชัดเจน")
+    else:
+        for m in milestones:
+            lines.append(f"- {m}")
+
+    return "\n".join(lines)
+
+
 def generate_mock_enterprise_tor():
     """Generates an authentic, unclassified enterprise-grade Cloud Migration & IT Modernization TOR for evaluation."""
     return """
@@ -386,6 +440,8 @@ def main():
     parser.add_argument("--days", type=int, default=30, help="Days of delay for penalty calculation")
     parser.add_argument("--audit", action="store_true", help="Run full audit on current or ingested document")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    parser.add_argument("--export-md", type=str, help="Export audit report as Markdown file")
+    parser.add_argument("--export-json", type=str, help="Export audit report as JSON file")
 
     args = parser.parse_args()
 
@@ -433,10 +489,26 @@ def main():
             print(json.dumps(res, ensure_ascii=False, indent=2))
         else:
             print(f"Daily Penalty: {daily:,.2f} THB | Total ({args.days} days): {accumulated:,.2f} THB | Cap (10%): {cap:,.2f} THB | Termination Risk: {exceeds_cap}")
+        if args.export_json:
+            with open(args.export_json, "w", encoding="utf-8") as ef:
+                json.dump(res, ef, ensure_ascii=False, indent=2)
+            print(f"[OK] Penalty report exported to JSON: {args.export_json}", file=sys.stderr)
         return
 
     if args.audit or scraped_text:
         audit_res = audit_document_clauses(args.doc_id, args.contract_value)
+        
+        if args.export_json:
+            with open(args.export_json, "w", encoding="utf-8") as ef:
+                json.dump(audit_res, ef, ensure_ascii=False, indent=2)
+            print(f"[OK] Audit report exported to JSON: {args.export_json}", file=sys.stderr)
+
+        if args.export_md:
+            md_content = render_audit_markdown(audit_res)
+            with open(args.export_md, "w", encoding="utf-8") as ef:
+                ef.write(md_content)
+            print(f"[OK] Audit report exported to Markdown: {args.export_md}", file=sys.stderr)
+
         if args.json:
             print(json.dumps(audit_res, ensure_ascii=False, indent=2))
         else:
